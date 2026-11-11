@@ -1,0 +1,116 @@
+name: Test release
+
+# A Windows build of any branch of this fork, published as the "test-build" pre-release, to try on
+# a PC before opening a pull request. Each run replaces the last one. This file stays on the fork.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The branch or commit to build
+        required: true
+        default: main
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    name: Native loader
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # native/build.sh pins its compilers to the maintainer's cores; this runs them on any.
+      - name: Use every runner core
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cat > "$RUNNER_TEMP/bin/taskset" <<'SHIM'
+          #!/bin/sh
+          [ "$1" = -c ] && shift 2
+          exec "$@"
+          SHIM
+          chmod +x "$RUNNER_TEMP/bin/taskset"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+          use-tool-cache: true
+
+      - name: Build
+        run: native/build.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native
+          path: native/dist/
+          retention-days: 1
+
+  windows:
+    name: Windows
+    needs: native
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-release
+          cache-on-failure: true
+
+      # No SWOFTY_LOGS_URL or SWOFTY_USAGE_URL: a test build sends nothing to the project's servers.
+      - name: Build
+        run: cargo build --release -p swofty-cli -p swofty-launcher
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: native
+          path: native/dist
+
+      - name: Fetch dxc
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: Swofty-Developments/SwoftyLauncher
+        run: tools/dxc/fetch.sh dxc-windows-x86_64.tar.gz
+
+      # Start-Test.bat keeps this build's data beside it, away from the installed launcher's.
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "SwoftyLauncher-test"
+          New-Item -ItemType Directory -Force "$out/bin", "$out/loader" | Out-Null
+          Copy-Item target/release/swofty.exe, target/release/swofty-launcher.exe "$out/bin/"
+          Copy-Item -Recurse native/dist/* "$out/loader/"
+          if (Test-Path dxc) { Copy-Item -Recurse dxc "$out/dxc" }
+          Copy-Item LICENSE, THIRD_PARTY.md "$out/"
+          @(
+            '@echo off'
+            'set "SWOFTY_DATA_DIR=%~dp0data"'
+            'start "" "%~dp0bin\swofty-launcher.exe"'
+          ) | Set-Content -Encoding ascii "$out/Start-Test.bat"
+          Compress-Archive -Path $out -DestinationPath "$out.zip"
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          gh release delete test-build --cleanup-tag --yes || true
+          notes="Windows test build of \`$REF\` at \`${sha:0:8}\`. Unzip it and run \`Start-Test.bat\`. It keeps its data in its own \`data\` folder, so your installed launcher isn't touched."
+          gh release create test-build SwoftyLauncher-test.zip \
+            --prerelease --title "Test Release" --target "$sha" --notes "$notes"
